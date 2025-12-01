@@ -142,12 +142,12 @@ CourseSync-Agent addresses these challenges through an intelligent multi-agent s
 2. **Create and activate virtual environment**
    ```bash
    # Windows
-   python -m venv coursesync-env
-   .\coursesync-env\Scripts\activate
+   python -m venv venv
+   .\venv\Scripts\activate
 
    # Linux/Mac
-   python -m venv coursesync-env
-   source coursesync-env/bin/activate
+   python -m venv venv
+   source venv/bin/activate
    ```
 
 3. **Install dependencies**

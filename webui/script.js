@@ -1,6 +1,11 @@
 // API Base URL
 const API_BASE = '/api';
 
+// Cache configuration
+const CACHE_PREFIX = 'coursesync_cache_';
+const CACHE_VERSION = '1.0';
+const CACHE_EXPIRY = 5 * 60 * 1000; // 5 minutes
+
 // State
 let appState = {
     courses: [],
@@ -8,6 +13,101 @@ let appState = {
     settings: {},
     stats: {}
 };
+
+// Cache Management
+function getCacheKey(endpoint, params = {}) {
+    const paramString = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('&');
+    return `${CACHE_PREFIX}${endpoint}${paramString ? '?' + paramString : ''}`;
+}
+
+function getCachedData(endpoint, params = {}) {
+    try {
+        const cacheKey = getCacheKey(endpoint, params);
+        const cached = localStorage.getItem(cacheKey);
+        if (cached) {
+            const data = JSON.parse(cached);
+            // Check if cache is still valid (within expiry time)
+            if (Date.now() - data.timestamp < CACHE_EXPIRY) {
+                return data.value;
+            } else {
+                // Remove expired cache
+                localStorage.removeItem(cacheKey);
+            }
+        }
+    } catch (error) {
+        console.warn('Cache read error:', error);
+    }
+    return null;
+}
+
+function setCachedData(endpoint, params = {}, data) {
+    try {
+        const cacheKey = getCacheKey(endpoint, params);
+        const cacheData = {
+            value: data,
+            timestamp: Date.now(),
+            version: CACHE_VERSION
+        };
+        localStorage.setItem(cacheKey, JSON.stringify(cacheData));
+    } catch (error) {
+        console.warn('Cache write error:', error);
+        // If storage is full, clear old cache entries
+        clearOldCache();
+    }
+}
+
+function clearCache(endpoint = null) {
+    try {
+        if (endpoint) {
+            // Clear specific endpoint cache
+            const keys = Object.keys(localStorage);
+            keys.forEach(key => {
+                if (key.startsWith(CACHE_PREFIX) && key.includes(endpoint)) {
+                    localStorage.removeItem(key);
+                }
+            });
+        } else {
+            // Clear all cache
+            const keys = Object.keys(localStorage);
+            keys.forEach(key => {
+                if (key.startsWith(CACHE_PREFIX)) {
+                    localStorage.removeItem(key);
+                }
+            });
+        }
+    } catch (error) {
+        console.warn('Cache clear error:', error);
+    }
+}
+
+function clearOldCache() {
+    try {
+        const keys = Object.keys(localStorage);
+        const now = Date.now();
+        keys.forEach(key => {
+            if (key.startsWith(CACHE_PREFIX)) {
+                try {
+                    const cached = JSON.parse(localStorage.getItem(key));
+                    if (now - cached.timestamp > CACHE_EXPIRY) {
+                        localStorage.removeItem(key);
+                    }
+                } catch (e) {
+                    localStorage.removeItem(key);
+                }
+            }
+        });
+    } catch (error) {
+        console.warn('Clear old cache error:', error);
+    }
+}
+
+function invalidateRelatedCache() {
+    // Invalidate cache for endpoints that depend on state
+    clearCache('/state');
+    clearCache('/workload');
+    clearCache('/schedule');
+    clearCache('/notifications');
+}
 
 // Initialize app
 document.addEventListener('DOMContentLoaded', () => {
@@ -138,16 +238,16 @@ function setupEventListeners() {
     });
     
     // Workload analysis
-    document.getElementById('analyzeWorkloadBtn').addEventListener('click', loadWorkload);
+    document.getElementById('analyzeWorkloadBtn').addEventListener('click', () => loadWorkload(true));
     
     // Schedule generation
     document.getElementById('generateScheduleBtn').addEventListener('click', () => {
         const hours = parseInt(document.getElementById('schedule-hours').value) || 4;
-        loadSchedule(hours);
+        loadSchedule(hours, true); // Force refresh for new schedule
     });
     
     // Notifications
-    document.getElementById('refreshNotificationsBtn').addEventListener('click', loadNotifications);
+    document.getElementById('refreshNotificationsBtn').addEventListener('click', () => loadNotifications(true));
     
     // Settings
     document.getElementById('saveSettingsBtn').addEventListener('click', saveSettings);
@@ -157,11 +257,47 @@ function setupEventListeners() {
     document.getElementById('assignment-filter').addEventListener('change', (e) => {
         renderAssignments(e.target.value);
     });
+    
+    // Force refresh button
+    document.getElementById('forceRefreshBtn').addEventListener('click', () => {
+        clearCache();
+        loadInitialData(true);
+        showToast('Cache cleared and data refreshed', 'success');
+    });
 }
 
-// API Calls
-async function fetchAPI(endpoint, options = {}) {
+// API Calls with Caching
+async function fetchAPI(endpoint, options = {}, useCache = true) {
+    const method = options.method || 'GET';
+    const isGetRequest = method === 'GET';
+    
+    // For GET requests, check cache first
+    if (isGetRequest && useCache) {
+        // Extract query params from endpoint
+        const urlParts = endpoint.split('?');
+        const path = urlParts[0];
+        const queryString = urlParts[1] || '';
+        const params = {};
+        
+        if (queryString) {
+            queryString.split('&').forEach(param => {
+                const [key, value] = param.split('=');
+                if (key && value) {
+                    params[decodeURIComponent(key)] = decodeURIComponent(value);
+                }
+            });
+        }
+        
+        const cached = getCachedData(path, params);
+        if (cached !== null) {
+            console.log(`[Cache Hit] ${endpoint}`);
+            return cached;
+        }
+    }
+    
+    // Fetch from API
     try {
+        console.log(`[API Call] ${method} ${endpoint}`);
         const response = await fetch(`${API_BASE}${endpoint}`, {
             ...options,
             headers: {
@@ -175,17 +311,68 @@ async function fetchAPI(endpoint, options = {}) {
             throw new Error(error.detail || error.error || 'Request failed');
         }
         
-        return await response.json();
+        const data = await response.json();
+        
+        // Cache GET requests
+        if (isGetRequest && useCache) {
+            const urlParts = endpoint.split('?');
+            const path = urlParts[0];
+            const queryString = urlParts[1] || '';
+            const params = {};
+            
+            if (queryString) {
+                queryString.split('&').forEach(param => {
+                    const [key, value] = param.split('=');
+                    if (key && value) {
+                        params[decodeURIComponent(key)] = decodeURIComponent(value);
+                    }
+                });
+            }
+            
+            setCachedData(path, params, data);
+        }
+        
+        return data;
     } catch (error) {
         console.error('API Error:', error);
         throw error;
     }
 }
 
-async function loadInitialData() {
+// Force refresh - clear cache and fetch fresh data
+async function forceRefresh(endpoint = null) {
+    if (endpoint) {
+        clearCache(endpoint);
+    } else {
+        clearCache(); // Clear all cache
+    }
+    await loadInitialData();
+}
+
+async function loadInitialData(force = false) {
+    if (!force) {
+        // Try to load from cache first
+        const cachedState = getCachedData('/state');
+        if (cachedState) {
+            appState = cachedState;
+            updateDashboard();
+            renderCourses();
+            renderAssignments('all');
+            // Load settings from cache or API
+            const cachedSettings = getCachedData('/settings');
+            if (cachedSettings) {
+                appState.settings = cachedSettings;
+                applySettingsToUI(cachedSettings);
+            } else {
+                loadSettings();
+            }
+            return;
+        }
+    }
+    
     showLoading();
     try {
-        const state = await fetchAPI('/state');
+        const state = await fetchAPI('/state', {}, !force);
         appState = state;
         updateDashboard();
         renderCourses();
@@ -196,6 +383,15 @@ async function loadInitialData() {
     } finally {
         hideLoading();
     }
+}
+
+function applySettingsToUI(settings) {
+    document.getElementById('setting-hours').value = settings.hours_per_day || 4;
+    document.getElementById('setting-risk').value = settings.risk_threshold || 20;
+    document.getElementById('setting-lead').value = settings.notification_lead_days || 3;
+    document.getElementById('setting-email-enabled').checked = settings.email_enabled || false;
+    document.getElementById('setting-email-to').value = settings.email_to || '';
+    document.getElementById('setting-email-schedule').checked = settings.email_schedule_enabled || false;
 }
 
 function loadPageData(pageName) {
@@ -210,16 +406,21 @@ function loadPageData(pageName) {
             renderAssignments('all');
             break;
         case 'workload':
-            loadWorkload();
+            loadWorkload(false); // Use cache if available
             break;
         case 'schedule':
             // Schedule will be loaded when user clicks generate
+            // But if we have cached schedule, show it
+            const cachedSchedule = getCachedData('/schedule', { hours_per_day: appState.settings.hours_per_day || 4 });
+            if (cachedSchedule && cachedSchedule.success) {
+                renderSchedule(cachedSchedule.schedule);
+            }
             break;
         case 'notifications':
-            loadNotifications();
+            loadNotifications(false); // Use cache if available
             break;
         case 'settings':
-            loadSettings();
+            loadSettings(false); // Use cache if available
             break;
     }
 }
@@ -345,8 +546,9 @@ async function deleteCourse(index) {
     
     showLoading();
     try {
-        await fetchAPI(`/course/${index}`, { method: 'DELETE' });
-        await loadInitialData();
+        await fetchAPI(`/course/${index}`, { method: 'DELETE' }, false);
+        invalidateRelatedCache();
+        await loadInitialData(true); // Force refresh after delete
         showToast('Course deleted successfully', 'success');
     } catch (error) {
         showToast('Failed to delete course: ' + error.message, 'error');
@@ -362,13 +564,14 @@ async function addCourseFromText(text, semesterStart) {
         const result = await fetchAPI('/syllabus/text', {
             method: 'POST',
             body: JSON.stringify({ syllabus_text: text, semester_start: semesterStart })
-        });
+        }, false);
         
         if (result.success) {
+            invalidateRelatedCache();
             showToast('Course added successfully!', 'success');
             document.getElementById('addCourseModal').classList.remove('active');
             document.getElementById('syllabus-text').value = '';
-            await loadInitialData();
+            await loadInitialData(true); // Force refresh after add
             switchPage('courses');
         } else {
             showToast(result.error || 'Failed to add course', 'error');
@@ -386,13 +589,14 @@ async function addCourseFromURL(url, semesterStart) {
         const result = await fetchAPI('/syllabus/url', {
             method: 'POST',
             body: JSON.stringify({ url, semester_start: semesterStart })
-        });
+        }, false);
         
         if (result.success) {
+            invalidateRelatedCache();
             showToast('Course scraped and added successfully!', 'success');
             document.getElementById('addCourseModal').classList.remove('active');
             document.getElementById('course-url').value = '';
-            await loadInitialData();
+            await loadInitialData(true); // Force refresh after add
             switchPage('courses');
         } else {
             showToast(result.error || 'Failed to scrape course', 'error');
@@ -419,10 +623,11 @@ async function addCourseFromPDF(file, semesterStart) {
         const result = await response.json();
         
         if (result.success) {
+            invalidateRelatedCache();
             showToast('Course added from PDF successfully!', 'success');
             document.getElementById('addCourseModal').classList.remove('active');
             document.getElementById('pdf-file').value = '';
-            await loadInitialData();
+            await loadInitialData(true); // Force refresh after add
             switchPage('courses');
         } else {
             showToast(result.error || 'Failed to parse PDF', 'error');
@@ -510,9 +715,15 @@ async function updateProgress(index, progress) {
         await fetchAPI('/progress', {
             method: 'POST',
             body: JSON.stringify({ assignment_index: index, progress: progressValue })
-        });
+        }, false);
         
-        await loadInitialData();
+        invalidateRelatedCache();
+        // Update local state immediately for better UX
+        if (appState.assignments[index]) {
+            appState.assignments[index].progress = progressValue;
+        }
+        updateDashboard();
+        renderAssignments(document.getElementById('assignment-filter').value);
         showToast('Progress updated', 'success');
     } catch (error) {
         showToast('Failed to update progress: ' + error.message, 'error');
@@ -520,10 +731,10 @@ async function updateProgress(index, progress) {
 }
 
 // Workload
-async function loadWorkload() {
+async function loadWorkload(force = false) {
     showLoading();
     try {
-        const result = await fetchAPI('/workload');
+        const result = await fetchAPI('/workload', {}, !force);
         
         if (result.success && result.analysis) {
             renderWorkload(result.analysis);
@@ -602,10 +813,10 @@ function renderWorkload(analysis) {
 }
 
 // Schedule
-async function loadSchedule(hoursPerDay) {
+async function loadSchedule(hoursPerDay, force = false) {
     showLoading();
     try {
-        const result = await fetchAPI(`/schedule?hours_per_day=${hoursPerDay}`);
+        const result = await fetchAPI(`/schedule?hours_per_day=${hoursPerDay}`, {}, !force);
         
         if (result.success && result.schedule) {
             renderSchedule(result.schedule);
@@ -680,10 +891,10 @@ function renderSchedule(schedule) {
 }
 
 // Notifications
-async function loadNotifications() {
+async function loadNotifications(force = false) {
     showLoading();
     try {
-        const result = await fetchAPI('/notifications');
+        const result = await fetchAPI('/notifications', {}, !force);
         
         if (result.success && result.notifications) {
             renderNotifications(result.notifications);
@@ -741,17 +952,11 @@ function renderNotifications(notifications) {
 }
 
 // Settings
-async function loadSettings() {
+async function loadSettings(force = false) {
     try {
-        const settings = await fetchAPI('/settings');
+        const settings = await fetchAPI('/settings', {}, !force);
         appState.settings = settings;
-        
-        document.getElementById('setting-hours').value = settings.hours_per_day || 4;
-        document.getElementById('setting-risk').value = settings.risk_threshold || 20;
-        document.getElementById('setting-lead').value = settings.notification_lead_days || 3;
-        document.getElementById('setting-email-enabled').checked = settings.email_enabled || false;
-        document.getElementById('setting-email-to').value = settings.email_to || '';
-        document.getElementById('setting-email-schedule').checked = settings.email_schedule_enabled || false;
+        applySettingsToUI(settings);
     } catch (error) {
         showToast('Failed to load settings: ' + error.message, 'error');
     }
@@ -772,9 +977,11 @@ async function saveSettings() {
         await fetchAPI('/settings', {
             method: 'POST',
             body: JSON.stringify(settings)
-        });
+        }, false);
         
-        await loadInitialData();
+        clearCache('/settings');
+        invalidateRelatedCache(); // Settings affect schedule/workload
+        await loadSettings(true);
         showToast('Settings saved successfully!', 'success');
     } catch (error) {
         showToast('Failed to save settings: ' + error.message, 'error');
